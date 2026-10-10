@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -54,14 +55,14 @@ class AddRoomDialog(QDialog):
         layout = QVBoxLayout(self)
         title = QLabel("添加一个直播间")
         title.setObjectName("dialogTitle")
-        help_text = QLabel("粘贴抖音或小红书的直播间/分享链接。开播后会自动开始录制。")
+        help_text = QLabel("粘贴抖音、小红书、哔哩哔哩直播间链接，或可直接播放的直播流地址。")
         help_text.setWordWrap(True)
         help_text.setObjectName("muted")
         layout.addWidget(title)
         layout.addWidget(help_text)
         form = QFormLayout()
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("https://live.douyin.com/... 或 https://xhslink.com/...")
+        self.url_edit.setPlaceholderText("直播间链接，或 https://...m3u8 / rtmp://... 直播流")
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("可选，例如：小明的直播")
         self.quality = QComboBox()
@@ -130,7 +131,10 @@ class MainWindow(QMainWindow):
         self.rooms: dict[int, Room] = {}
         self.room_rows: dict[int, int] = {}
         self.recording_started: dict[int, float] = {}
-        self.setWindowTitle("直播守候 · 抖音与小红书录制")
+        self.tray_icon: QSystemTrayIcon | None = None
+        self._tray_notice_shown = False
+        self._quitting = False
+        self.setWindowTitle("直播守候 · 多平台直播录制")
         self.resize(1120, 760)
         self.setMinimumSize(920, 640)
         self._build_ui()
@@ -304,6 +308,10 @@ class MainWindow(QMainWindow):
         warning.setObjectName("warning")
         warning.setWordWrap(True)
         form.addRow("", warning)
+        sleep_note = QLabel("监测期间会阻止电脑自动休眠，但允许屏幕正常熄灭。合上笔记本盖仍会休眠。")
+        sleep_note.setObjectName("muted")
+        sleep_note.setWordWrap(True)
+        form.addRow("后台运行", sleep_note)
         save = QPushButton("保存设置")
         save.setObjectName("primaryButton")
         save.clicked.connect(self.save_settings)
@@ -502,9 +510,18 @@ class MainWindow(QMainWindow):
     def load_history(self) -> None:
         history = self.storage.list_history()
         self.history_table.setRowCount(len(history))
-        result_labels = {"recording": "录制中", "completed": "已完成", "stopped": "已停止", "failed": "失败"}
+        result_labels = {
+            "recording": "录制中",
+            "completed": "已完成",
+            "stopped": "已停止",
+            "failed": "连接中断",
+            "recovered": "唤醒后恢复",
+        }
         for row, item in enumerate(history):
-            platform = "抖音" if item["platform"] == Platform.DOUYIN.value else "小红书"
+            try:
+                platform = Platform(item["platform"]).label
+            except ValueError:
+                platform = item["platform"]
             values = [
                 platform, item["anchor_name"], item["title"], item["started_at"].replace("T", " "),
                 (item["ended_at"] or "—").replace("T", " "), result_labels.get(item["result"], item["result"]),
@@ -517,16 +534,42 @@ class MainWindow(QMainWindow):
                 self.history_table.setItem(row, column, cell)
             self.history_table.setRowHeight(row, 44)
 
-    def closeEvent(self, event) -> None:
+    def set_tray_icon(self, tray_icon: QSystemTrayIcon) -> None:
+        self.tray_icon = tray_icon
+
+    def show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def request_quit(self) -> None:
         if self.recording_started:
             answer = QMessageBox.question(
                 self, "退出直播守候", "当前仍有直播正在录制。退出会安全停止录制，确定继续吗？",
             )
             if answer != QMessageBox.Yes:
-                event.ignore()
                 return
+        self._quitting = True
         self.manager.shutdown()
-        event.accept()
+        if self.tray_icon:
+            self.tray_icon.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event) -> None:
+        if self._quitting or not self.tray_icon or not self.tray_icon.isVisible():
+            self.manager.shutdown()
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        if not self._tray_notice_shown:
+            self.tray_icon.showMessage(
+                "直播守候仍在运行",
+                "窗口已缩到菜单栏，将继续监测和录制。点击菜单栏图标可重新打开。",
+                QSystemTrayIcon.MessageIcon.Information,
+                5000,
+            )
+            self._tray_notice_shown = True
 
 
 APP_STYLE = """

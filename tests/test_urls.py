@@ -11,15 +11,17 @@ from live_recorder.urls import UnsupportedPlatform, normalize_and_detect
         ("v.douyin.com/abc", Platform.DOUYIN),
         ("https://www.xiaohongshu.com/user/profile/abc", Platform.XIAOHONGSHU),
         ("https://xhslink.com/a1b2", Platform.XIAOHONGSHU),
+        ("https://live.bilibili.com/123", Platform.BILIBILI),
+        ("https://example.com/live/index.m3u8", Platform.GENERIC),
+        ("rtmp://example.com/live/stream", Platform.GENERIC),
     ],
 )
 def test_supported_urls(url, platform):
     normalized, detected = normalize_and_detect(url)
-    assert normalized.startswith("https://")
+    assert normalized.startswith(("https://", "rtmp://", "rtmps://"))
     assert detected is platform
 
 
-def test_rejects_other_platform():
+def test_rejects_invalid_input():
     with pytest.raises(UnsupportedPlatform):
-        normalize_and_detect("https://example.com/live")
-
+        normalize_and_detect("not a valid url")

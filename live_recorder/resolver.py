@@ -15,6 +15,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 QUALITY_INDEX = {"OD": 0, "UHD": 1, "HD": 2, "SD": 3, "LD": 4}
+BILIBILI_QUALITY = {"OD": 10000, "UHD": 10000, "HD": 400, "SD": 250, "LD": 80}
 
 
 class ResolveError(RuntimeError):
@@ -148,11 +149,95 @@ async def resolve_xiaohongshu(url: str, cookie: str = "") -> StreamInfo:
         return StreamInfo(Platform.XIAOHONGSHU, final_url, anchor, "", False)
 
 
+async def resolve_bilibili(url: str, quality: str) -> StreamInfo:
+    headers = {"User-Agent": USER_AGENT, "Referer": "https://live.bilibili.com/"}
+    async with httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
+        page = await client.get(url)
+        page.raise_for_status()
+        final_url = str(page.url)
+        match = re.search(r"live\.bilibili\.com/(\d+)", final_url)
+        if not match:
+            raise ResolveError("无法识别哔哩哔哩直播间，请使用 live.bilibili.com 的房间链接")
+        short_id = match.group(1)
+        init_response = await client.get(
+            "https://api.live.bilibili.com/room/v1/Room/room_init", params={"id": short_id}
+        )
+        init_response.raise_for_status()
+        init_data = init_response.json().get("data") or {}
+        room_id = str(init_data.get("room_id") or short_id)
+        info_response = await client.get(
+            "https://api.live.bilibili.com/room/v1/Room/get_info",
+            params={"room_id": room_id},
+        )
+        info_response.raise_for_status()
+        info = info_response.json().get("data") or {}
+        anchor_response = await client.get(
+            "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room",
+            params={"roomid": room_id},
+        )
+        anchor_response.raise_for_status()
+        anchor_info = ((anchor_response.json().get("data") or {}).get("info") or {})
+        anchor = _clean(anchor_info.get("uname"), f"哔哩哔哩主播{room_id}")
+        title = _clean(info.get("title"), "直播")
+        if int(init_data.get("live_status") or info.get("live_status") or 0) != 1:
+            return StreamInfo(Platform.BILIBILI, final_url, anchor, title, False)
+
+        play_response = await client.get(
+            "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo",
+            params={
+                "room_id": room_id,
+                "protocol": "0,1",
+                "format": "0,1,2",
+                "codec": "0,1",
+                "qn": BILIBILI_QUALITY.get(quality, 10000),
+                "platform": "web",
+                "ptype": "8",
+            },
+        )
+        play_response.raise_for_status()
+        playurl = ((play_response.json().get("data") or {}).get("playurl_info") or {}).get("playurl") or {}
+        candidates: list[tuple[int, str]] = []
+        for stream in playurl.get("stream") or []:
+            protocol = stream.get("protocol_name", "")
+            for format_info in stream.get("format") or []:
+                format_name = format_info.get("format_name", "")
+                for codec in format_info.get("codec") or []:
+                    base_url = codec.get("base_url") or ""
+                    for url_info in codec.get("url_info") or []:
+                        full_url = (url_info.get("host") or "") + base_url + (url_info.get("extra") or "")
+                        if full_url:
+                            priority = 0 if protocol == "http_hls" and format_name == "fmp4" else 1
+                            candidates.append((priority, full_url))
+        if not candidates:
+            raise ResolveError("直播已开播，但没有找到可录制的视频流")
+        candidates.sort(key=lambda item: item[0])
+        return StreamInfo(
+            Platform.BILIBILI,
+            final_url,
+            anchor,
+            title,
+            True,
+            candidates[0][1],
+            f"Referer: https://live.bilibili.com/{room_id}\r\nUser-Agent: {USER_AGENT}\r\n",
+        )
+
+
+async def resolve_generic(url: str) -> StreamInfo:
+    parsed = urllib.parse.urlparse(url)
+    name = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).split("?")[0]
+    anchor = name.rsplit(".", 1)[0] if name else "通用直播流"
+    return StreamInfo(Platform.GENERIC, url, anchor or "通用直播流", "直播", True, url)
+
+
 async def resolve(platform: Platform, url: str, quality: str, cookie: str = "") -> StreamInfo:
     try:
         if platform is Platform.DOUYIN:
             return await resolve_douyin(url, quality, cookie)
-        return await resolve_xiaohongshu(url, cookie)
+        if platform is Platform.XIAOHONGSHU:
+            return await resolve_xiaohongshu(url, cookie)
+        if platform is Platform.BILIBILI:
+            return await resolve_bilibili(url, quality)
+        return await resolve_generic(url)
     except ResolveError:
         raise
     except Exception as exc:

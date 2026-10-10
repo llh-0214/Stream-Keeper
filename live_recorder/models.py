@@ -8,10 +8,17 @@ from pathlib import Path
 class Platform(str, Enum):
     DOUYIN = "douyin"
     XIAOHONGSHU = "xiaohongshu"
+    BILIBILI = "bilibili"
+    GENERIC = "generic"
 
     @property
     def label(self) -> str:
-        return "抖音" if self is Platform.DOUYIN else "小红书"
+        return {
+            self.DOUYIN: "抖音",
+            self.XIAOHONGSHU: "小红书",
+            self.BILIBILI: "哔哩哔哩",
+            self.GENERIC: "通用直播流",
+        }[self]
 
 
 class RoomStatus(str, Enum):
@@ -64,4 +71,3 @@ class RecordingOptions:
     check_interval: int = 60
     douyin_cookie: str = ""
     xhs_cookie: str = ""
-

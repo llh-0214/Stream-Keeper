@@ -15,6 +15,7 @@ import imageio_ffmpeg
 from PySide6.QtCore import QObject, Signal
 
 from .models import Platform, RecordingOptions, Room, RoomStatus, StreamInfo
+from .power import SleepPreventer
 from .resolver import ResolveError, resolve
 from .storage import Storage
 
@@ -31,6 +32,7 @@ class ActiveRecording:
     output_pattern: Path
     started_at: float
     stopping: bool = False
+    recovering: bool = False
 
 
 class RecorderManager(QObject):
@@ -48,7 +50,10 @@ class RecorderManager(QObject):
         self._thread: threading.Thread | None = None
         self._active: dict[int, ActiveRecording] = {}
         self._active_lock = threading.Lock()
+        self._sequence_lock = threading.Lock()
         self._next_check: dict[int, float] = {}
+        self._sleep_preventer = SleepPreventer()
+        self._last_loop_at = time.time()
 
     @property
     def running(self) -> bool:
@@ -58,6 +63,8 @@ class RecorderManager(QObject):
         if self.running:
             return
         self._stop.clear()
+        self._last_loop_at = time.time()
+        self._sleep_preventer.start()
         self._thread = threading.Thread(target=self._monitor_loop, name="room-monitor", daemon=True)
         self._thread.start()
 
@@ -73,6 +80,10 @@ class RecorderManager(QObject):
 
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
+            now_wall = time.time()
+            if now_wall - self._last_loop_at > 8:
+                self._recover_after_wake()
+            self._last_loop_at = now_wall
             rooms = self.storage.list_rooms()
             options = self.storage.load_options()
             options.output_dir.mkdir(parents=True, exist_ok=True)
@@ -93,9 +104,30 @@ class RecorderManager(QObject):
             self._wake.wait(timeout=1.0)
             self._wake.clear()
 
+    def _recover_after_wake(self) -> None:
+        """Discard stale network processes and immediately resolve fresh URLs."""
+        self._next_check.clear()
+        with self._active_lock:
+            recordings = list(self._active.values())
+        for active in recordings:
+            if active.process.poll() is not None:
+                continue
+            active.recovering = True
+            try:
+                if active.process.stdin:
+                    active.process.stdin.write(b"q\n")
+                    active.process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            threading.Thread(target=self._force_stop_later, args=(active,), daemon=True).start()
+
     def _check_room(self, room: Room, options: RecordingOptions) -> None:
         self.room_status.emit(room.id, RoomStatus.CHECKING.value, "正在检测直播状态…")
-        cookie = options.douyin_cookie if room.platform is Platform.DOUYIN else options.xhs_cookie
+        cookie = ""
+        if room.platform is Platform.DOUYIN:
+            cookie = options.douyin_cookie
+        elif room.platform is Platform.XIAOHONGSHU:
+            cookie = options.xhs_cookie
         try:
             info = asyncio.run(resolve(room.platform, room.url, room.quality, cookie))
             if not info.is_live:
@@ -111,17 +143,30 @@ class RecorderManager(QObject):
 
     def _start_recording(self, room: Room, info: StreamInfo, options: RecordingOptions) -> None:
         anchor = safe_name(room.display_name or info.anchor_name, room.platform.label + "主播")
-        day_dir = options.output_dir / room.platform.label / anchor / datetime.now().strftime("%Y-%m-%d")
+        started_at = datetime.now()
+        day_dir = options.output_dir / room.platform.label / anchor / started_at.strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%H-%M-%S")
+        date_text = started_at.strftime("%Y%m%d")
         title = safe_name(info.title, "直播")
         segment_seconds = max(60, options.segment_minutes * 60)
-        pattern = day_dir / f"{anchor}_{title}_{stamp}_%03d.mp4"
+        with self._sequence_lock:
+            start_number = next_daily_sequence(day_dir, anchor, date_text)
+        pattern = day_dir / f"{anchor}_{date_text}_%03d.mp4"
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         command = [
             ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
             "-rw_timeout", "20000000",
         ]
+        if info.stream_url.startswith(("http://", "https://")):
+            command += [
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_on_http_error", "4xx,5xx",
+                "-reconnect_delay_max", "10",
+                "-reconnect_delay_total_max", "60",
+            ]
         if info.headers:
             command += ["-headers", info.headers]
         command += [
@@ -129,6 +174,7 @@ class RecorderManager(QObject):
             "-map", "0:v?", "-map", "0:a?",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-f", "segment", "-segment_time", str(segment_seconds),
+            "-segment_start_number", str(start_number),
             "-reset_timestamps", "1", "-segment_format", "mp4",
             "-segment_format_options", "movflags=+frag_keyframe+empty_moov",
             str(pattern),
@@ -161,19 +207,27 @@ class RecorderManager(QObject):
         active.process.wait()
         return_code = active.process.returncode
         message = (stderr or b"").decode("utf-8", errors="replace")[-1200:].strip()
-        result = "stopped" if active.stopping else ("completed" if return_code == 0 else "failed")
-        error = "" if result in {"stopped", "completed"} else message
+        if active.recovering:
+            result = "recovered"
+        elif active.stopping:
+            result = "stopped"
+        else:
+            result = "completed" if return_code == 0 else "failed"
+        error = "" if result in {"stopped", "completed", "recovered"} else message
         self.storage.finish_history(active.history_id, result, error)
         with self._active_lock:
             self._active.pop(room.id, None)
         if result == "failed":
             display = message.splitlines()[-1] if message else f"FFmpeg 返回 {return_code}"
-            self.room_status.emit(room.id, RoomStatus.ERROR.value, f"录制中断：{display}")
+            self.room_status.emit(room.id, RoomStatus.ERROR.value, f"直播流中断，正在重新连接：{display}")
+        elif result == "recovered":
+            self.room_status.emit(room.id, RoomStatus.CHECKING.value, "电脑已唤醒，正在恢复录制…")
         else:
-            self.room_status.emit(room.id, RoomStatus.OFFLINE.value, "录制已结束，等待下次开播")
+            self.room_status.emit(room.id, RoomStatus.CHECKING.value, "录制流已结束，正在确认直播状态…")
         self.recording_finished.emit(room.id, result, str(active.output_pattern.parent))
         self.history_changed.emit()
-        self._next_check[room.id] = time.monotonic() + 15
+        self._next_check[room.id] = time.monotonic() + (1 if active.recovering else 3)
+        self._wake.set()
         self._emit_counts()
 
     def stop_recording(self, room_id: int) -> None:
@@ -212,8 +266,21 @@ class RecorderManager(QObject):
             self.stop_recording(room_id)
         if self._thread:
             self._thread.join(timeout=3)
+        self._sleep_preventer.stop()
 
     def active_started_at(self, room_id: int) -> float | None:
         with self._active_lock:
             active = self._active.get(room_id)
             return active.started_at if active else None
+
+
+def next_daily_sequence(day_dir: Path, anchor: str, date_text: str) -> int:
+    """Return the next sequence number for 主播名_年月日_序号.mp4."""
+    expression = re.compile(rf"^{re.escape(anchor)}_{re.escape(date_text)}_(\d+)\.mp4$")
+    largest = 0
+    if day_dir.exists():
+        for path in day_dir.iterdir():
+            match = expression.match(path.name)
+            if match:
+                largest = max(largest, int(match.group(1)))
+    return largest + 1
