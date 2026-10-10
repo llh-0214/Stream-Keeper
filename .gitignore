@@ -1,0 +1,16 @@
+.DS_Store
+.venv/
+.uv-cache/
+.pyinstaller-cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.db
+*.db-wal
+*.db-shm
+recordings/
+third_party/upstream/src/
