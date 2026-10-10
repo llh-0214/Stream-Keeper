@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
+VERSION = "0.2.0"
 
 
 def run(command: list[str]) -> None:
@@ -43,6 +44,14 @@ def main() -> None:
     if system == "Darwin":
         app = DIST / "直播守候.app"
         dmg = DIST / "StreamKeeper-macOS.dmg"
+        info_plist = app / "Contents" / "Info.plist"
+        if info_plist.exists():
+            run([
+                "/usr/libexec/PlistBuddy", "-c",
+                f"Set :CFBundleShortVersionString {VERSION}", str(info_plist),
+            ])
+            run(["/usr/libexec/PlistBuddy", "-c", f"Add :CFBundleVersion string {VERSION}", str(info_plist)])
+            run(["codesign", "--force", "--deep", "--sign", "-", str(app)])
         if app.exists() and shutil.which("hdiutil"):
             try:
                 run(["hdiutil", "create", "-volname", "直播守候", "-srcfolder", str(app), "-ov", "-format", "UDZO", str(dmg)])
