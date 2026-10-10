@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -38,7 +39,7 @@ from .urls import UnsupportedPlatform, normalize_and_detect
 STATUS_COLORS = {
     RoomStatus.PAUSED.value: "#7A8499",
     RoomStatus.CHECKING.value: "#E3A738",
-    RoomStatus.OFFLINE.value: "#7A8499",
+    RoomStatus.OFFLINE.value: "#65A98B",
     RoomStatus.LIVE.value: "#35B57B",
     RoomStatus.RECORDING.value: "#FF5A63",
     RoomStatus.ERROR.value: "#E25555",
@@ -85,23 +86,40 @@ class AddRoomDialog(QDialog):
         return url, platform, self.name_edit.text().strip(), str(self.quality.currentData())
 
 
-class StatCard(QFrame):
-    def __init__(self, caption: str, value: str, accent: str):
-        super().__init__()
-        self.setObjectName("statCard")
+class EditRoomDialog(QDialog):
+    def __init__(self, room: Room, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.room = room
+        self.delete_requested = False
+        self.setWindowTitle("编辑直播间")
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color:{accent}; font-size:16px")
-        self.value = QLabel(value)
-        self.value.setObjectName("statValue")
-        label = QLabel(caption)
-        label.setObjectName("muted")
-        top = QHBoxLayout()
-        top.addWidget(self.value)
-        top.addStretch()
-        top.addWidget(dot)
-        layout.addLayout(top)
-        layout.addWidget(label)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(room.display_name)
+        self.quality = QComboBox()
+        qualities = [("原画", "OD"), ("超清", "UHD"), ("高清", "HD"), ("标清", "SD"), ("流畅", "LD")]
+        for label, value in qualities:
+            self.quality.addItem(label, value)
+        self.quality.setCurrentIndex(max(0, self.quality.findData(room.quality)))
+        self.enabled = QCheckBox("自动监测开播状态")
+        self.enabled.setChecked(room.enabled)
+        form.addRow("备注名称", self.name_edit)
+        form.addRow("录制画质", self.quality)
+        form.addRow("", self.enabled)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Save)
+        buttons.button(QDialogButtonBox.Save).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        delete = buttons.addButton("删除直播间", QDialogButtonBox.DestructiveRole)
+        delete.setObjectName("dangerText")
+        delete.clicked.connect(self._request_delete)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _request_delete(self) -> None:
+        self.delete_requested = True
+        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -135,18 +153,22 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(218)
+        sidebar.setFixedWidth(194)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(20, 24, 20, 20)
-        brand = QLabel("◉  直播守候")
+        side.setContentsMargins(22, 28, 18, 22)
+        brand_row = QHBoxLayout()
+        brand_icon = QLabel()
+        brand_icon.setPixmap(QApplication.instance().windowIcon().pixmap(38, 38))
+        brand = QLabel("直播守候")
         brand.setObjectName("brand")
-        subtitle = QLabel("STREAM KEEPER")
-        subtitle.setObjectName("brandSub")
-        side.addWidget(brand)
-        side.addWidget(subtitle)
-        side.addSpacing(28)
+        brand_row.addWidget(brand_icon)
+        brand_row.addSpacing(6)
+        brand_row.addWidget(brand)
+        brand_row.addStretch()
+        side.addLayout(brand_row)
+        side.addSpacing(50)
         self.nav_buttons: list[QPushButton] = []
-        for label, index in [("⌂  录制任务", 0), ("◷  历史记录", 1), ("⚙  偏好设置", 2)]:
+        for label, index in [("☷   录制任务", 0), ("◷   历史记录", 1), ("⚙   设置", 2)]:
             button = QPushButton(label)
             button.setObjectName("navButton")
             button.setCheckable(True)
@@ -155,7 +177,7 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(button)
         self.nav_buttons[0].setChecked(True)
         side.addStretch()
-        privacy = QLabel("所有配置和历史记录\n只保存在这台电脑")
+        privacy = QLabel("数据仅保存在本机")
         privacy.setObjectName("privacy")
         privacy.setAlignment(Qt.AlignCenter)
         side.addWidget(privacy)
@@ -185,40 +207,47 @@ class MainWindow(QMainWindow):
 
     def _dashboard_page(self) -> QWidget:
         page = QWidget()
-        layout, header = self._page_header("录制任务", "添加直播间，程序会自动等待并在开播后录制")
+        layout, header = self._page_header("录制任务", "正在监测 0 个直播间")
+        self.monitoring_label = header.itemAt(0).layout().itemAt(1).widget()
         add = QPushButton("＋ 添加直播间")
         add.setObjectName("primaryButton")
         add.clicked.connect(self.add_room)
         header.addWidget(add)
 
-        cards = QHBoxLayout()
-        self.monitor_card = StatCard("正在监测", "0", "#665CF6")
-        self.recording_card = StatCard("正在录制", "0", "#FF5A63")
-        self.path_card = StatCard("保存格式", "MP4", "#35B57B")
-        cards.addWidget(self.monitor_card)
-        cards.addWidget(self.recording_card)
-        cards.addWidget(self.path_card)
-        layout.addSpacing(18)
-        layout.addLayout(cards)
-        layout.addSpacing(22)
+        layout.addSpacing(28)
+        panel = QFrame()
+        panel.setObjectName("taskPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+        panel_title = QLabel("直播间")
+        panel_title.setObjectName("panelTitle")
+        panel_title.setContentsMargins(24, 20, 24, 18)
+        panel_layout.addWidget(panel_title)
 
-        self.room_table = QTableWidget(0, 7)
-        self.room_table.setHorizontalHeaderLabels(["平台 / 名称", "直播间", "状态", "录制时长", "画质", "自动监测", "操作"])
+        self.room_table = QTableWidget(0, 4)
+        self.room_table.setHorizontalHeaderLabels(["直播间", "平台", "状态", "操作"])
+        self.room_table.horizontalHeader().setVisible(False)
         self.room_table.verticalHeader().setVisible(False)
         self.room_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.room_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.room_table.setShowGrid(False)
-        self.room_table.setAlternatingRowColors(True)
-        self.room_table.setMinimumHeight(330)
+        self.room_table.setAlternatingRowColors(False)
+        self.room_table.setMinimumHeight(160)
+        self.room_table.cellDoubleClicked.connect(lambda row, _column: self.edit_room_by_row(row))
         header_view = self.room_table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(0, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header_view.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        header_view.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        layout.addWidget(self.room_table, 1)
+        header_view.setSectionResizeMode(3, QHeaderView.Fixed)
+        header_view.resizeSection(3, 120)
+        panel_layout.addWidget(self.room_table)
+        hint = QLabel("关闭窗口后，监测仍会在后台继续")
+        hint.setObjectName("panelHint")
+        hint.setContentsMargins(24, 16, 24, 16)
+        panel_layout.addWidget(hint)
+        layout.addWidget(panel)
+        layout.addStretch()
         page.setLayout(layout)
         return page
 
@@ -311,36 +340,67 @@ class MainWindow(QMainWindow):
 
     def _render_room(self, row: int, room: Room) -> None:
         label = room.display_name or room.platform.label + "直播间"
-        platform_item = QTableWidgetItem(f"{room.platform.label}\n{label}")
-        platform_item.setData(Qt.UserRole, room.id)
-        self.room_table.setItem(row, 0, platform_item)
-        url_item = QTableWidgetItem(room.url)
-        url_item.setToolTip(room.url)
-        self.room_table.setItem(row, 1, url_item)
-        status = QTableWidgetItem(room.status.label)
-        status.setForeground(QColor(STATUS_COLORS[room.status.value]))
-        status.setToolTip(room.last_message)
-        self.room_table.setItem(row, 2, status)
-        self.room_table.setItem(row, 3, QTableWidgetItem("—"))
-        quality_labels = {"OD": "原画", "UHD": "超清", "HD": "高清", "SD": "标清", "LD": "流畅"}
-        self.room_table.setItem(row, 4, QTableWidgetItem(quality_labels.get(room.quality, room.quality)))
-        toggle = QPushButton("已开启" if room.enabled else "已暂停")
-        toggle.setCheckable(True)
-        toggle.setChecked(room.enabled)
-        toggle.clicked.connect(lambda checked=False, rid=room.id: self.toggle_room(rid, checked))
-        self.room_table.setCellWidget(row, 5, toggle)
+        name_item = QTableWidgetItem(label)
+        name_item.setData(Qt.UserRole, room.id)
+        name_item.setToolTip(room.url)
+        self.room_table.setItem(row, 0, name_item)
+        platform_item = QTableWidgetItem(room.platform.label)
+        platform_item.setForeground(QColor("#7A8499"))
+        self.room_table.setItem(row, 1, platform_item)
+        self._set_status_cell(row, room)
+        self._set_action_cell(row, room)
+        self.room_table.setRowHeight(row, 72)
+
+    def _set_status_cell(self, row: int, room: Room, elapsed: str = "") -> None:
+        labels = {
+            RoomStatus.OFFLINE: "等待开播",
+            RoomStatus.CHECKING: "正在检测",
+            RoomStatus.LIVE: "准备录制",
+        }
+        label = labels.get(room.status, room.status.label)
+        if room.status is RoomStatus.RECORDING and elapsed:
+            label = f"录制中 · {elapsed}"
+        item = QTableWidgetItem(f"●  {label}")
+        item.setForeground(QColor(STATUS_COLORS[room.status.value]))
+        item.setToolTip(room.last_message)
+        self.room_table.setItem(row, 2, item)
+
+    def _set_action_cell(self, row: int, room: Room) -> None:
         actions = QWidget()
         action_layout = QHBoxLayout(actions)
-        action_layout.setContentsMargins(2, 2, 2, 2)
-        stop = QPushButton("停止")
-        stop.setObjectName("dangerText")
-        stop.clicked.connect(lambda checked=False, rid=room.id: self.manager.stop_recording(rid))
-        remove = QPushButton("删除")
-        remove.clicked.connect(lambda checked=False, rid=room.id: self.remove_room(rid))
-        action_layout.addWidget(stop)
-        action_layout.addWidget(remove)
-        self.room_table.setCellWidget(row, 6, actions)
-        self.room_table.setRowHeight(row, 58)
+        action_layout.setContentsMargins(4, 8, 14, 8)
+        if room.status is RoomStatus.RECORDING:
+            button = QPushButton("停止")
+            button.setObjectName("dangerText")
+            button.clicked.connect(lambda checked=False, rid=room.id: self.manager.stop_recording(rid))
+        else:
+            button = QPushButton("编辑")
+            button.clicked.connect(lambda checked=False, rid=room.id: self.edit_room(rid))
+        button.setFixedWidth(82)
+        action_layout.addStretch()
+        action_layout.addWidget(button)
+        self.room_table.setCellWidget(row, 3, actions)
+
+    def edit_room_by_row(self, row: int) -> None:
+        item = self.room_table.item(row, 0)
+        if item is not None:
+            self.edit_room(int(item.data(Qt.UserRole)))
+
+    def edit_room(self, room_id: int) -> None:
+        room = self.rooms[room_id]
+        dialog = EditRoomDialog(room, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.delete_requested:
+            self.remove_room(room_id)
+            return
+        room.display_name = dialog.name_edit.text().strip()
+        room.quality = str(dialog.quality.currentData())
+        room.enabled = dialog.enabled.isChecked()
+        room.status = RoomStatus.OFFLINE if room.enabled else RoomStatus.PAUSED
+        self.storage.update_room(room)
+        self.load_rooms()
+        self.manager.wake()
 
     def add_room(self) -> None:
         dialog = AddRoomDialog(self)
@@ -381,18 +441,16 @@ class MainWindow(QMainWindow):
             return
         row = self.room_rows[room_id]
         status = RoomStatus(status_value)
-        item = QTableWidgetItem(status.label)
-        item.setForeground(QColor(STATUS_COLORS[status_value]))
-        item.setToolTip(message)
-        self.room_table.setItem(row, 2, item)
         self.rooms[room_id].status = status
         self.rooms[room_id].last_message = message
+        self._set_status_cell(row, self.rooms[room_id])
+        self._set_action_cell(row, self.rooms[room_id])
 
     def on_recording_started(self, room_id: int, path: str, started_at: float) -> None:
         self.recording_started[room_id] = started_at
         row = self.room_rows.get(room_id)
         if row is not None:
-            self.room_table.item(row, 3).setToolTip(path)
+            self.room_table.item(row, 2).setToolTip(path)
 
     def on_recording_finished(self, room_id: int, result: str, folder: str) -> None:
         self.recording_started.pop(room_id, None)
@@ -407,11 +465,11 @@ class MainWindow(QMainWindow):
             elapsed = max(0, int(now - started))
             hours, remain = divmod(elapsed, 3600)
             minutes, seconds = divmod(remain, 60)
-            self.room_table.setItem(row, 3, QTableWidgetItem(f"{hours:02d}:{minutes:02d}:{seconds:02d}"))
+            self._set_status_cell(row, self.rooms[room_id], f"{hours:02d}:{minutes:02d}:{seconds:02d}")
 
     def update_counts(self, monitoring: int, recording: int) -> None:
-        self.monitor_card.value.setText(str(monitoring))
-        self.recording_card.value.setText(str(recording))
+        suffix = f" · {recording} 个正在录制" if recording else ""
+        self.monitoring_label.setText(f"正在监测 {monitoring} 个直播间{suffix}")
 
     def load_settings(self) -> None:
         options = self.storage.load_options()
@@ -472,33 +530,33 @@ class MainWindow(QMainWindow):
 
 
 APP_STYLE = """
-QWidget { background: #F6F7FB; color: #1C2434; font-family: -apple-system, "PingFang SC", "Microsoft YaHei"; font-size: 14px; }
+QWidget { background: #FFFCF4; color: #17233F; font-family: -apple-system, "PingFang SC", "Microsoft YaHei"; font-size: 14px; }
 QLabel { background: transparent; }
-#sidebar { background: #171B2C; }
-#brand { color: white; font-size: 21px; font-weight: 700; }
-#brandSub { color: #777F9C; font-size: 10px; letter-spacing: 2px; }
-#privacy { color: #777F9C; background: #20263B; border-radius: 10px; padding: 12px; font-size: 12px; }
-#navButton { text-align: left; color: #AAB0C3; background: transparent; border: 0; padding: 12px 14px; border-radius: 9px; }
-#navButton:hover { background: #22283D; color: white; }
-#navButton:checked { background: #665CF6; color: white; font-weight: 600; }
-#pageTitle { font-size: 27px; font-weight: 750; }
+#sidebar { background: #FFF9EA; border-right: 1px solid #ECE8DD; }
+#brand { color: #17233F; font-size: 19px; font-weight: 750; }
+#privacy { color: #9A9EAA; padding: 8px; font-size: 12px; }
+#navButton { text-align: left; color: #657087; background: transparent; border: 0; border-left: 4px solid transparent; padding: 13px 12px; border-radius: 3px; }
+#navButton:hover { background: #FFF3C8; color: #17233F; }
+#navButton:checked { background: transparent; color: #17233F; border-left: 4px solid #FFD83D; font-weight: 700; }
+#pageTitle { font-size: 29px; font-weight: 750; }
 #dialogTitle { font-size: 21px; font-weight: 700; }
 #muted { color: #7A8499; }
 #warning { color: #B66A12; background: #FFF5DC; border-radius: 7px; padding: 10px; }
-#statCard, #settingsPanel { background: white; border: 1px solid #E8EAF1; border-radius: 13px; }
-#statValue { font-size: 25px; font-weight: 750; }
-QPushButton { background: white; border: 1px solid #DDE1EA; padding: 8px 13px; border-radius: 8px; }
-QPushButton:hover { border-color: #665CF6; color: #5147E5; }
-QPushButton:checked { background: #EEF0FF; color: #5147E5; border-color: #C9C5FF; }
-#primaryButton { background: #665CF6; color: white; border: none; padding: 10px 17px; font-weight: 650; }
-#primaryButton:hover { background: #554AE7; color: white; }
+#settingsPanel, #taskPanel { background: white; border: 1px solid #E1E3E8; border-radius: 11px; }
+#panelTitle { background: white; border-bottom: 1px solid #ECEEF2; font-size: 19px; font-weight: 750; }
+#panelHint { color: #8C93A2; background: #FCFCFB; border-top: 1px solid #ECEEF2; }
+QPushButton { background: white; border: 1px solid #CDD2DB; padding: 8px 13px; border-radius: 8px; }
+QPushButton:hover { border-color: #17233F; color: #17233F; }
+QPushButton:checked { background: #FFF3C8; color: #17233F; border-color: #FFD83D; }
+#primaryButton { background: #FFD83D; color: #17233F; border: none; padding: 11px 18px; font-weight: 700; }
+#primaryButton:hover { background: #F3C925; color: #17233F; }
 #dangerText { color: #D84A56; }
 QLineEdit, QComboBox, QSpinBox { background: white; border: 1px solid #DDE1EA; padding: 9px 10px; border-radius: 7px; min-height: 20px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #665CF6; }
-QTableWidget { background: white; border: 1px solid #E8EAF1; border-radius: 12px; alternate-background-color: #FAFBFD; selection-background-color: #EEF0FF; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #E2B916; }
+QTableWidget { background: white; border: none; alternate-background-color: white; selection-background-color: #FFF7DB; }
 QHeaderView::section { background: #F1F3F8; color: #626D82; border: none; border-bottom: 1px solid #E3E6EE; padding: 11px; font-weight: 650; }
-QTableWidget::item { padding: 8px; border-bottom: 1px solid #EFF1F5; }
-QMessageBox, QDialog { background: #F6F7FB; }
+QTableWidget::item { padding: 14px; border-bottom: 1px solid #ECEEF2; }
+QMessageBox, QDialog { background: #FFFCF4; }
 """
 
 

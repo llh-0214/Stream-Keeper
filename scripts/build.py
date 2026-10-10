@@ -27,9 +27,12 @@ def main() -> None:
     command = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--windowed", "--name", "直播守候",
+        "--icon",
+        str(ROOT / "assets" / ("streamkeeper.ico" if system == "Windows" else "streamkeeper.icns")),
         "--collect-all", "imageio_ffmpeg",
         "--hidden-import", "httpx",
         "--hidden-import", "httpcore",
+        "--add-data", f"assets/app-icon-concept-v2.png{';' if system == 'Windows' else ':'}assets",
         "--add-data", f"third_party/upstream/LICENSE{';' if system == 'Windows' else ':'}licenses/upstream",
         "run.py",
     ]
