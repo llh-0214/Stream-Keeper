@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def test_history_round_trip(tmp_path: Path):
     assert item["result"] == "completed"
     assert item["anchor_name"] == "主播"
     assert item["files_created"] == 1
-    assert str(video) in item["files_json"]
+    assert json.loads(item["files_json"]) == [str(video)]
 
 
 def test_legacy_history_backfill_distinguishes_same_day_sessions(tmp_path: Path):
