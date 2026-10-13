@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -515,6 +516,7 @@ class MainWindow(QMainWindow):
             "completed": "已完成",
             "stopped": "已停止",
             "failed": "连接中断",
+            "failed_no_output": "未生成文件",
             "recovered": "唤醒后恢复",
         }
         for row, item in enumerate(history):
@@ -522,15 +524,36 @@ class MainWindow(QMainWindow):
                 platform = Platform(item["platform"]).label
             except ValueError:
                 platform = item["platform"]
+            files = json.loads(item.get("files_json") or "[]")
+            existing_files = [path for value in files if (path := Path(value)).is_file()]
+            files_created = item.get("files_created")
+            result_label = result_labels.get(item["result"], item["result"])
+            if files_created:
+                result_label += f"（{files_created} 段）"
+            if existing_files:
+                location = str(existing_files[0].parent)
+                location_tooltip = "\n".join(str(path) for path in existing_files)
+            elif item["result"] == "recording":
+                location = "正在等待生成文件…"
+                location_tooltip = str(Path(item["file_path"]).parent)
+            elif files_created == 0 or item["result"] == "failed_no_output":
+                location = "未生成文件"
+                location_tooltip = item.get("error") or "本次录制没有产生视频文件"
+            elif files_created:
+                location = "文件已移动或删除"
+                location_tooltip = str(Path(item["file_path"]).parent)
+            else:
+                # Records made by versions before file tracking was added.
+                location = str(Path(item["file_path"]).parent)
+                location_tooltip = "旧版记录，无法确认本次实际生成的文件"
             values = [
                 platform, item["anchor_name"], item["title"], item["started_at"].replace("T", " "),
-                (item["ended_at"] or "—").replace("T", " "), result_labels.get(item["result"], item["result"]),
-                str(Path(item["file_path"]).parent),
+                (item["ended_at"] or "—").replace("T", " "), result_label, location,
             ]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 if column == 6:
-                    cell.setToolTip(value)
+                    cell.setToolTip(location_tooltip)
                 self.history_table.setItem(row, column, cell)
             self.history_table.setRowHeight(row, 44)
 

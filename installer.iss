@@ -1,5 +1,5 @@
 #define MyAppName "直播守候"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.1"
 #define MyAppPublisher "Stream Keeper"
 #define MyAppExeName "直播守候.exe"
 

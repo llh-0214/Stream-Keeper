@@ -1,6 +1,6 @@
 [project]
 name = "stream-keeper"
-version = "0.2.0"
+version = "0.2.1"
 description = "抖音、小红书、哔哩哔哩和通用直播流自动录制桌面工具"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"

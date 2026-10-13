@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import sqlite3
 from dataclasses import asdict
 from datetime import datetime
@@ -61,6 +62,8 @@ class Storage:
                     ended_at TEXT,
                     result TEXT NOT NULL DEFAULT 'recording',
                     error TEXT NOT NULL DEFAULT '',
+                    files_created INTEGER,
+                    files_json TEXT,
                     FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE SET NULL
                 );
                 CREATE TABLE IF NOT EXISTS settings (
@@ -68,6 +71,37 @@ class Storage:
                     value TEXT NOT NULL
                 );
                 """
+            )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(history)").fetchall()}
+            if "files_created" not in columns:
+                db.execute("ALTER TABLE history ADD COLUMN files_created INTEGER")
+            if "files_json" not in columns:
+                db.execute("ALTER TABLE history ADD COLUMN files_json TEXT")
+            self._backfill_history_files(db)
+
+    @staticmethod
+    def _backfill_history_files(db: sqlite3.Connection) -> None:
+        """Attribute legacy segment files to their recording by modification time."""
+        rows = db.execute(
+            "SELECT id,file_path,started_at,ended_at FROM history "
+            "WHERE files_json IS NULL AND ended_at IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            pattern = Path(row["file_path"])
+            glob_name = re.sub(r"%0?\d*d", "*", pattern.name)
+            try:
+                started = datetime.fromisoformat(row["started_at"]).timestamp() - 5
+                ended = datetime.fromisoformat(row["ended_at"]).timestamp() + 30
+                files = [
+                    path for path in pattern.parent.glob(glob_name)
+                    if started <= path.stat().st_mtime <= ended
+                ]
+            except (OSError, ValueError):
+                files = []
+            file_strings = [str(path) for path in sorted(files)]
+            db.execute(
+                "UPDATE history SET files_created=?,files_json=? WHERE id=?",
+                (len(file_strings), json.dumps(file_strings, ensure_ascii=False), row["id"]),
             )
 
     def list_rooms(self) -> list[Room]:
@@ -139,17 +173,26 @@ class Storage:
     def start_history(self, room: Room, anchor: str, title: str, path: Path) -> int:
         with self._connect() as db:
             cursor = db.execute(
-                "INSERT INTO history(room_id,platform,anchor_name,title,file_path,started_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (room.id, room.platform.value, anchor, title, str(path), datetime.now().isoformat(timespec="seconds")),
+                "INSERT INTO history(room_id,platform,anchor_name,title,file_path,started_at,files_created,files_json) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    room.id, room.platform.value, anchor, title, str(path),
+                    datetime.now().isoformat(timespec="seconds"), 0, "[]",
+                ),
             )
             return int(cursor.lastrowid)
 
-    def finish_history(self, history_id: int, result: str, error: str = "") -> None:
+    def finish_history(
+        self, history_id: int, result: str, error: str = "", files: list[Path] | None = None,
+    ) -> None:
+        file_strings = [str(path) for path in (files or [])]
         with self._connect() as db:
             db.execute(
-                "UPDATE history SET ended_at=?,result=?,error=? WHERE id=?",
-                (datetime.now().isoformat(timespec="seconds"), result, error, history_id),
+                "UPDATE history SET ended_at=?,result=?,error=?,files_created=?,files_json=? WHERE id=?",
+                (
+                    datetime.now().isoformat(timespec="seconds"), result, error,
+                    len(file_strings), json.dumps(file_strings, ensure_ascii=False), history_id,
+                ),
             )
 
     def list_history(self, limit: int = 300) -> list[dict[str, Any]]:

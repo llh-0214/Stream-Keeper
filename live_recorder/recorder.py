@@ -31,8 +31,14 @@ class ActiveRecording:
     history_id: int
     output_pattern: Path
     started_at: float
+    initial_files: frozenset[Path]
+    used_fallback: bool = False
+    has_fallback: bool = False
+    validated: bool = False
     stopping: bool = False
     recovering: bool = False
+    no_data_timeout: bool = False
+    timeout_message: str = ""
 
 
 class RecorderManager(QObject):
@@ -52,6 +58,7 @@ class RecorderManager(QObject):
         self._active_lock = threading.Lock()
         self._sequence_lock = threading.Lock()
         self._next_check: dict[int, float] = {}
+        self._fallback_next: set[int] = set()
         self._sleep_preventer = SleepPreventer()
         self._last_loop_at = time.time()
 
@@ -75,7 +82,7 @@ class RecorderManager(QObject):
     def _emit_counts(self, rooms: list[Room] | None = None) -> None:
         rooms = rooms or self.storage.list_rooms()
         with self._active_lock:
-            recording_count = len(self._active)
+            recording_count = sum(active.validated for active in self._active.values())
         self.counts_changed.emit(sum(room.enabled for room in rooms), recording_count)
 
     def _monitor_loop(self) -> None:
@@ -152,12 +159,16 @@ class RecorderManager(QObject):
         with self._sequence_lock:
             start_number = next_daily_sequence(day_dir, anchor, date_text)
         pattern = day_dir / f"{anchor}_{date_text}_%03d.mp4"
+        initial_files = frozenset(recording_files(pattern))
+        use_fallback = room.id in self._fallback_next and bool(info.fallback_urls)
+        self._fallback_next.discard(room.id)
+        stream_url = info.fallback_urls[0] if use_fallback else info.stream_url
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         command = [
             ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
             "-rw_timeout", "20000000",
         ]
-        if info.stream_url.startswith(("http://", "https://")):
+        if stream_url.startswith(("http://", "https://")):
             command += [
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
@@ -170,7 +181,7 @@ class RecorderManager(QObject):
         if info.headers:
             command += ["-headers", info.headers]
         command += [
-            "-i", info.stream_url,
+            "-i", stream_url,
             "-map", "0:v?", "-map", "0:a?",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-f", "segment", "-segment_time", str(segment_seconds),
@@ -192,32 +203,78 @@ class RecorderManager(QObject):
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"无法启动 FFmpeg：{exc}")
             return
         history_id = self.storage.start_history(room, anchor, info.title, pattern)
-        active = ActiveRecording(process, history_id, pattern, time.time())
+        active = ActiveRecording(
+            process, history_id, pattern, time.time(), initial_files,
+            used_fallback=use_fallback, has_fallback=bool(info.fallback_urls),
+        )
         with self._active_lock:
             self._active[room.id] = active
-        self.room_status.emit(room.id, RoomStatus.RECORDING.value, f"正在录制：{title}")
-        self.recording_started.emit(room.id, str(pattern), active.started_at)
+        self.room_status.emit(room.id, RoomStatus.LIVE.value, f"正在连接视频流：{title}")
         self._emit_counts()
+        threading.Thread(
+            target=self._watch_output, args=(room, active, title),
+            name=f"output-{room.id}", daemon=True,
+        ).start()
         threading.Thread(
             target=self._watch_process, args=(room, active), name=f"ffmpeg-{room.id}", daemon=True
         ).start()
+
+    def _watch_output(self, room: Room, active: ActiveRecording, title: str) -> None:
+        """Confirm real output and stop stale FFmpeg processes so a fresh URL is resolved."""
+        startup_deadline = time.monotonic() + 45
+        last_growth = time.monotonic()
+        last_bytes = 0
+        while not self._stop.is_set() and active.process.poll() is None:
+            files = new_recording_files(active.output_pattern, active.initial_files)
+            total_bytes = recording_size(files)
+            now = time.monotonic()
+            if total_bytes > last_bytes:
+                last_bytes = total_bytes
+                last_growth = now
+            if total_bytes > 0 and not active.validated:
+                active.validated = True
+                self._fallback_next.discard(room.id)
+                self.room_status.emit(room.id, RoomStatus.RECORDING.value, f"正在录制：{title}")
+                self.recording_started.emit(room.id, str(active.output_pattern), active.started_at)
+                self._emit_counts()
+            if not active.validated and now >= startup_deadline:
+                active.no_data_timeout = True
+                active.timeout_message = "连接视频流超时：45 秒内没有生成有效视频文件"
+                self._terminate_active(active)
+                return
+            if active.validated and now - last_growth >= 90:
+                active.no_data_timeout = True
+                active.timeout_message = "直播流连续 90 秒没有新数据"
+                self._terminate_active(active)
+                return
+            time.sleep(1)
 
     def _watch_process(self, room: Room, active: ActiveRecording) -> None:
         stderr = active.process.stderr.read() if active.process.stderr else b""
         active.process.wait()
         return_code = active.process.returncode
         message = (stderr or b"").decode("utf-8", errors="replace")[-1200:].strip()
+        files = new_recording_files(active.output_pattern, active.initial_files)
         if active.recovering:
             result = "recovered"
         elif active.stopping:
             result = "stopped"
+        elif not files:
+            result = "failed_no_output"
         else:
             result = "completed" if return_code == 0 else "failed"
+        if active.no_data_timeout:
+            message = "\n".join(part for part in (active.timeout_message, message) if part)
         error = "" if result in {"stopped", "completed", "recovered"} else message
-        self.storage.finish_history(active.history_id, result, error)
+        self.storage.finish_history(active.history_id, result, error, files)
         with self._active_lock:
             self._active.pop(room.id, None)
-        if result == "failed":
+        if result == "failed_no_output":
+            if active.has_fallback and not active.used_fallback:
+                self._fallback_next.add(room.id)
+            display = active.timeout_message or (message.splitlines()[-1] if message else "没有收到视频数据")
+            self.room_status.emit(room.id, RoomStatus.ERROR.value, f"未生成文件，正在重新连接：{display}")
+        elif result == "failed":
             display = message.splitlines()[-1] if message else f"FFmpeg 返回 {return_code}"
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"直播流中断，正在重新连接：{display}")
         elif result == "recovered":
@@ -226,7 +283,8 @@ class RecorderManager(QObject):
             self.room_status.emit(room.id, RoomStatus.CHECKING.value, "录制流已结束，正在确认直播状态…")
         self.recording_finished.emit(room.id, result, str(active.output_pattern.parent))
         self.history_changed.emit()
-        self._next_check[room.id] = time.monotonic() + (1 if active.recovering else 3)
+        retry_quickly = active.recovering or result in {"failed", "failed_no_output"}
+        self._next_check[room.id] = time.monotonic() + (1 if retry_quickly else 3)
         self._wake.set()
         self._emit_counts()
 
@@ -243,6 +301,16 @@ class RecorderManager(QObject):
         except (BrokenPipeError, OSError):
             pass
         threading.Thread(target=self._force_stop_later, args=(active,), daemon=True).start()
+
+    @staticmethod
+    def _terminate_active(active: ActiveRecording) -> None:
+        try:
+            if active.process.stdin:
+                active.process.stdin.write(b"q\n")
+                active.process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        threading.Thread(target=RecorderManager._force_stop_later, args=(active,), daemon=True).start()
 
     @staticmethod
     def _force_stop_later(active: ActiveRecording) -> None:
@@ -284,3 +352,23 @@ def next_daily_sequence(day_dir: Path, anchor: str, date_text: str) -> int:
             if match:
                 largest = max(largest, int(match.group(1)))
     return largest + 1
+
+
+def recording_files(pattern: Path) -> list[Path]:
+    """Return files produced by an FFmpeg numeric segment pattern."""
+    glob_name = re.sub(r"%0?\d*d", "*", pattern.name)
+    return sorted(pattern.parent.glob(glob_name))
+
+
+def new_recording_files(pattern: Path, initial_files: frozenset[Path]) -> list[Path]:
+    return [path for path in recording_files(pattern) if path not in initial_files]
+
+
+def recording_size(files: list[Path]) -> int:
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total

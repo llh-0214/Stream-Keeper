@@ -62,6 +62,7 @@ class StreamInfo:
     is_live: bool
     stream_url: str = ""
     headers: str = ""
+    fallback_urls: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

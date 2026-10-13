@@ -26,25 +26,37 @@ def _clean(value: Any, default: str = "") -> str:
     return str(value) if value is not None else default
 
 
-def _pick_quality(stream_url: dict[str, Any], quality: str) -> str:
+def _pick_quality(stream_url: dict[str, Any], quality: str) -> tuple[str, tuple[str, ...]]:
     hls = list((stream_url.get("hls_pull_url_map") or {}).values())
     flv = list((stream_url.get("flv_pull_url") or {}).values())
-    candidates = hls or flv
-    if not candidates:
+    if not hls and not flv:
         pull_data = stream_url.get("live_core_sdk_data", {}).get("pull_data", {})
         raw = pull_data.get("stream_data")
         if raw:
             data = json.loads(raw).get("data", {})
             for item in data.values():
                 main = item.get("main", {})
+                if main.get("flv"):
+                    flv.append(main["flv"])
                 if main.get("hls"):
-                    candidates.append(main["hls"])
-                elif main.get("flv"):
-                    candidates.append(main["flv"])
-    if not candidates:
+                    hls.append(main["hls"])
+    if not flv and not hls:
         raise ResolveError("直播已开播，但没有找到可录制的视频流")
-    index = min(QUALITY_INDEX.get(quality, 0), len(candidates) - 1)
-    return candidates[index]
+
+    # Douyin HLS playlists can remain reachable while their media segments have
+    # already expired. FLV is normally a single long-lived response and is more
+    # reliable for unattended recording, so use it first and retain HLS as an
+    # immediate fallback.
+    preferred = flv or hls
+    alternate = hls if flv else []
+    requested_index = QUALITY_INDEX.get(quality, 0)
+    primary = preferred[min(requested_index, len(preferred) - 1)]
+    fallbacks: list[str] = []
+    if alternate:
+        fallbacks.append(alternate[min(requested_index, len(alternate) - 1)])
+    fallbacks.extend(url for url in preferred if url != primary)
+    fallbacks.extend(url for url in alternate if url not in fallbacks)
+    return primary, tuple(url for url in fallbacks if url != primary)
 
 
 async def _fetch_douyin_room(url: str, cookie: str) -> dict[str, Any]:
@@ -105,10 +117,13 @@ async def resolve_douyin(url: str, quality: str, cookie: str = "") -> StreamInfo
     if room.get("status", 4) != 2:
         return StreamInfo(Platform.DOUYIN, url, anchor, "", False)
     stream_url = room.get("stream_url") or {}
+    primary_url, fallback_urls = _pick_quality(stream_url, quality)
+    cookie_header = f"Cookie: {cookie.strip()}\r\n" if cookie.strip() else ""
     return StreamInfo(
         Platform.DOUYIN, url, anchor, _clean(room.get("title"), "直播"), True,
-        _pick_quality(stream_url, quality),
-        f"Referer: https://live.douyin.com/\r\nUser-Agent: {USER_AGENT}\r\n",
+        primary_url,
+        f"Referer: https://live.douyin.com/\r\nUser-Agent: {USER_AGENT}\r\n{cookie_header}",
+        fallback_urls,
     )
 
 
