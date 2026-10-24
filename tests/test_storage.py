@@ -57,3 +57,18 @@ def test_legacy_history_backfill_distinguishes_same_day_sessions(tmp_path: Path)
     item = storage.list_history()[0]
     assert item["files_created"] == 0
     assert item["files_json"] == "[]"
+
+
+def test_existing_failed_history_with_files_is_migrated_to_saved(tmp_path: Path):
+    storage = Storage(tmp_path)
+    room = storage.add_room(Platform.DOUYIN, "https://live.douyin.com/migrate")
+    history_id = storage.start_history(room, "主播", "标题", tmp_path / "video_%03d.mp4")
+    video = tmp_path / "video_001.mp4"
+    video.touch()
+    storage.finish_history(history_id, "failed", "network error", [video])
+
+    Storage(tmp_path)
+
+    item = storage.list_history()[0]
+    assert item["result"] == "saved"
+    assert item["files_created"] == 1

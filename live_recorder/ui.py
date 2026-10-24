@@ -44,6 +44,7 @@ STATUS_COLORS = {
     RoomStatus.OFFLINE.value: "#65A98B",
     RoomStatus.LIVE.value: "#35B57B",
     RoomStatus.RECORDING.value: "#FF5A63",
+    RoomStatus.PROTECTED.value: "#B66A12",
     RoomStatus.ERROR.value: "#E25555",
 }
 
@@ -514,10 +515,12 @@ class MainWindow(QMainWindow):
         result_labels = {
             "recording": "录制中",
             "completed": "已完成",
+            "saved": "已保存",
             "stopped": "已停止",
             "failed": "连接中断",
             "failed_no_output": "未生成文件",
             "recovered": "唤醒后恢复",
+            "encrypted": "会员加密，无法录制",
         }
         for row, item in enumerate(history):
             try:

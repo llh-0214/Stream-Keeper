@@ -78,6 +78,12 @@ class Storage:
             if "files_json" not in columns:
                 db.execute("ALTER TABLE history ADD COLUMN files_json TEXT")
             self._backfill_history_files(db)
+            # v0.2.1 labelled a recording as failed whenever FFmpeg ended with a
+            # network error, even if valid segments had already been saved.
+            db.execute(
+                "UPDATE history SET result='saved' "
+                "WHERE result='failed' AND COALESCE(files_created, 0) > 0"
+            )
 
     @staticmethod
     def _backfill_history_files(db: sqlite3.Connection) -> None:

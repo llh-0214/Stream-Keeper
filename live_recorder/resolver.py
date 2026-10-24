@@ -22,6 +22,37 @@ class ResolveError(RuntimeError):
     pass
 
 
+class ProtectedStreamError(ResolveError):
+    pass
+
+
+def _is_encrypted_douyin_stream(stream_url: dict[str, Any]) -> bool:
+    """Return whether Douyin only exposed a membership/encrypted media stream."""
+    urls: list[str] = []
+    for key in ("flv_pull_url", "hls_pull_url_map"):
+        urls.extend(str(value) for value in (stream_url.get(key) or {}).values())
+
+    pull_data = stream_url.get("live_core_sdk_data", {}).get("pull_data", {})
+    raw = pull_data.get("stream_data")
+    if raw:
+        try:
+            data = json.loads(raw).get("data", {})
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        for item in data.values():
+            main = item.get("main", {})
+            if main.get("enableEncryption") is True:
+                return True
+            urls.extend(str(main[key]) for key in ("flv", "hls") if main.get(key))
+
+    parsed = [urllib.parse.urlparse(url) for url in urls]
+    return any(
+        (item.hostname and "-encryption." in item.hostname.lower())
+        or "/encryption/" in item.path.lower()
+        for item in parsed
+    )
+
+
 def _clean(value: Any, default: str = "") -> str:
     return str(value) if value is not None else default
 
@@ -117,6 +148,10 @@ async def resolve_douyin(url: str, quality: str, cookie: str = "") -> StreamInfo
     if room.get("status", 4) != 2:
         return StreamInfo(Platform.DOUYIN, url, anchor, "", False)
     stream_url = room.get("stream_url") or {}
+    if _is_encrypted_douyin_stream(stream_url):
+        raise ProtectedStreamError(
+            "检测到会员加密直播，平台未提供普通可录制视频流；已停止录制，不会生成无效文件"
+        )
     primary_url, fallback_urls = _pick_quality(stream_url, quality)
     cookie_header = f"Cookie: {cookie.strip()}\r\n" if cookie.strip() else ""
     return StreamInfo(

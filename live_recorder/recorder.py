@@ -16,13 +16,22 @@ from PySide6.QtCore import QObject, Signal
 
 from .models import Platform, RecordingOptions, Room, RoomStatus, StreamInfo
 from .power import SleepPreventer
-from .resolver import ResolveError, resolve
+from .resolver import ProtectedStreamError, ResolveError, resolve
 from .storage import Storage
 
 
 def safe_name(value: str, fallback: str = "直播") -> str:
     value = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", value).strip(" ._")
     return value[:80] or fallback
+
+
+def system_sleep_gap(
+    last_wall: float, last_monotonic: float, now_wall: float, now_monotonic: float,
+) -> float:
+    """Estimate time spent asleep without mistaking slow network work for a wake."""
+    wall_elapsed = now_wall - last_wall
+    monotonic_elapsed = now_monotonic - last_monotonic
+    return max(0.0, wall_elapsed - monotonic_elapsed)
 
 
 @dataclass
@@ -60,7 +69,8 @@ class RecorderManager(QObject):
         self._next_check: dict[int, float] = {}
         self._fallback_next: set[int] = set()
         self._sleep_preventer = SleepPreventer()
-        self._last_loop_at = time.time()
+        self._last_wall_at = time.time()
+        self._last_monotonic_at = time.monotonic()
 
     @property
     def running(self) -> bool:
@@ -70,7 +80,8 @@ class RecorderManager(QObject):
         if self.running:
             return
         self._stop.clear()
-        self._last_loop_at = time.time()
+        self._last_wall_at = time.time()
+        self._last_monotonic_at = time.monotonic()
         self._sleep_preventer.start()
         self._thread = threading.Thread(target=self._monitor_loop, name="room-monitor", daemon=True)
         self._thread.start()
@@ -88,9 +99,13 @@ class RecorderManager(QObject):
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
             now_wall = time.time()
-            if now_wall - self._last_loop_at > 8:
+            now_monotonic = time.monotonic()
+            if system_sleep_gap(
+                self._last_wall_at, self._last_monotonic_at, now_wall, now_monotonic,
+            ) > 8:
                 self._recover_after_wake()
-            self._last_loop_at = now_wall
+            self._last_wall_at = now_wall
+            self._last_monotonic_at = now_monotonic
             rooms = self.storage.list_rooms()
             options = self.storage.load_options()
             options.output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +158,8 @@ class RecorderManager(QObject):
                 return
             self.room_status.emit(room.id, RoomStatus.LIVE.value, "检测到开播，正在启动录制…")
             self._start_recording(room, info, options)
+        except ProtectedStreamError as exc:
+            self.room_status.emit(room.id, RoomStatus.PROTECTED.value, str(exc))
         except ResolveError as exc:
             self.room_status.emit(room.id, RoomStatus.ERROR.value, str(exc))
         except (RuntimeError, OSError, ValueError, TypeError) as exc:
@@ -255,14 +272,7 @@ class RecorderManager(QObject):
         return_code = active.process.returncode
         message = (stderr or b"").decode("utf-8", errors="replace")[-1200:].strip()
         files = new_recording_files(active.output_pattern, active.initial_files)
-        if active.recovering:
-            result = "recovered"
-        elif active.stopping:
-            result = "stopped"
-        elif not files:
-            result = "failed_no_output"
-        else:
-            result = "completed" if return_code == 0 else "failed"
+        result = recording_result(active, return_code, files)
         if active.no_data_timeout:
             message = "\n".join(part for part in (active.timeout_message, message) if part)
         error = "" if result in {"stopped", "completed", "recovered"} else message
@@ -274,6 +284,11 @@ class RecorderManager(QObject):
                 self._fallback_next.add(room.id)
             display = active.timeout_message or (message.splitlines()[-1] if message else "没有收到视频数据")
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"未生成文件，正在重新连接：{display}")
+        elif result == "saved":
+            self.room_status.emit(
+                room.id, RoomStatus.CHECKING.value,
+                f"已保存 {len(files)} 段视频，正在确认直播状态…",
+            )
         elif result == "failed":
             display = message.splitlines()[-1] if message else f"FFmpeg 返回 {return_code}"
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"直播流中断，正在重新连接：{display}")
@@ -283,7 +298,7 @@ class RecorderManager(QObject):
             self.room_status.emit(room.id, RoomStatus.CHECKING.value, "录制流已结束，正在确认直播状态…")
         self.recording_finished.emit(room.id, result, str(active.output_pattern.parent))
         self.history_changed.emit()
-        retry_quickly = active.recovering or result in {"failed", "failed_no_output"}
+        retry_quickly = active.recovering or result in {"saved", "failed", "failed_no_output"}
         self._next_check[room.id] = time.monotonic() + (1 if retry_quickly else 3)
         self._wake.set()
         self._emit_counts()
@@ -372,3 +387,16 @@ def recording_size(files: list[Path]) -> int:
         except OSError:
             continue
     return total
+
+
+def recording_result(active: ActiveRecording, return_code: int | None, files: list[Path]) -> str:
+    """Describe the user-visible outcome without treating saved video as a failed recording."""
+    if active.recovering:
+        return "recovered"
+    if active.stopping:
+        return "stopped"
+    if not files:
+        return "failed_no_output"
+    if return_code == 0:
+        return "completed"
+    return "saved"

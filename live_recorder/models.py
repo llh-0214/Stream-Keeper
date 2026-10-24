@@ -27,6 +27,7 @@ class RoomStatus(str, Enum):
     OFFLINE = "offline"
     LIVE = "live"
     RECORDING = "recording"
+    PROTECTED = "protected"
     ERROR = "error"
 
     @property
@@ -37,6 +38,7 @@ class RoomStatus(str, Enum):
             self.OFFLINE: "未开播",
             self.LIVE: "已开播",
             self.RECORDING: "录制中",
+            self.PROTECTED: "会员直播",
             self.ERROR: "出错",
         }[self]
 
