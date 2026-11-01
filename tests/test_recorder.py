@@ -1,11 +1,15 @@
+from live_recorder.models import Platform
 from live_recorder.recorder import (
     ActiveRecording,
+    build_ffmpeg_command,
     new_recording_files,
     next_daily_sequence,
     recording_files,
     recording_result,
     safe_name,
+    should_reconnect_in_ffmpeg,
     system_sleep_gap,
+    video_output_args,
 )
 
 
@@ -68,3 +72,42 @@ def test_system_sleep_is_detected_from_clock_drift():
 
 def test_clock_rollback_does_not_trigger_sleep_recovery():
     assert system_sleep_gap(100.0, 40.0, 90.0, 45.0) == 0.0
+
+
+def test_douyin_flv_uses_application_level_reconnect():
+    assert not should_reconnect_in_ffmpeg(
+        Platform.DOUYIN,
+        "https://pull.example/live.flv?expire=123",
+    )
+    assert not should_reconnect_in_ffmpeg(
+        Platform.GENERIC,
+        "https://pull.example/live.flv?expire=123",
+    )
+    assert should_reconnect_in_ffmpeg(
+        Platform.GENERIC,
+        "https://pull.example/live.m3u8?expire=123",
+    )
+
+
+def test_douyin_video_is_decoded_and_reencoded_for_validation():
+    args = video_output_args(Platform.DOUYIN, 1800)
+    assert "libx264" in args
+    assert "expr:gte(t,n_forced*1800)" in args
+    assert video_output_args(Platform.XIAOHONGSHU, 1800) == ["-c:v", "copy"]
+
+
+def test_douyin_command_rejects_corrupt_frames_and_does_not_inline_reconnect(tmp_path):
+    command = build_ffmpeg_command(
+        "ffmpeg",
+        Platform.DOUYIN,
+        "https://pull.example/live.flv",
+        "",
+        tmp_path / "主播_%03d.mp4",
+        7,
+        1800,
+    )
+    assert "-xerror" in command
+    assert "explode" in command
+    assert "-reconnect" not in command
+    assert "libx264" in command
+    assert command[-1].endswith("主播_%03d.mp4")

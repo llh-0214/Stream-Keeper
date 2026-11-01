@@ -57,7 +57,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.4
-          name: 直播守候 v0.2.4
+          tag_name: v0.2.5
+          name: 直播守候 v0.2.5
           generate_release_notes: true
           files: release-files/*

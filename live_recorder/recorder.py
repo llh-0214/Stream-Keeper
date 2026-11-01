@@ -26,12 +26,113 @@ def safe_name(value: str, fallback: str = "直播") -> str:
 
 
 def system_sleep_gap(
-    last_wall: float, last_monotonic: float, now_wall: float, now_monotonic: float,
+    last_wall: float,
+    last_monotonic: float,
+    now_wall: float,
+    now_monotonic: float,
 ) -> float:
     """Estimate time spent asleep without mistaking slow network work for a wake."""
     wall_elapsed = now_wall - last_wall
     monotonic_elapsed = now_monotonic - last_monotonic
     return max(0.0, wall_elapsed - monotonic_elapsed)
+
+
+def should_reconnect_in_ffmpeg(platform: Platform, stream_url: str) -> bool:
+    """Avoid byte-range reconnects that can splice a broken live FLV stream."""
+    clean_url = stream_url.lower().split("?", 1)[0]
+    return (
+        stream_url.startswith(("http://", "https://"))
+        and platform is not Platform.DOUYIN
+        and not clean_url.endswith(".flv")
+    )
+
+
+def video_output_args(platform: Platform, segment_seconds: int) -> list[str]:
+    """Decode Douyin video so corrupt/encrypted frames stop the recording quickly."""
+    if platform is not Platform.DOUYIN:
+        return ["-c:v", "copy"]
+    keyframes = f"expr:gte(t,n_forced*{segment_seconds})"
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "60",
+        "-force_key_frames",
+        keyframes,
+    ]
+
+
+def build_ffmpeg_command(
+    ffmpeg: str,
+    platform: Platform,
+    stream_url: str,
+    headers: str,
+    pattern: Path,
+    start_number: int,
+    segment_seconds: int,
+) -> list[str]:
+    """Build a recording command with platform-safe reconnect and validation rules."""
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-y",
+        "-rw_timeout",
+        "20000000",
+        "-fflags",
+        "+discardcorrupt",
+        "-err_detect",
+        "explode",
+        "-xerror",
+    ]
+    if should_reconnect_in_ffmpeg(platform, stream_url):
+        command += [
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_at_eof",
+            "1",
+            "-reconnect_on_network_error",
+            "1",
+            "-reconnect_on_http_error",
+            "4xx,5xx",
+            "-reconnect_delay_max",
+            "10",
+            "-reconnect_delay_total_max",
+            "60",
+        ]
+    if headers:
+        command += ["-headers", headers]
+    command += ["-i", stream_url, "-map", "0:v?", "-map", "0:a?"]
+    command += video_output_args(platform, segment_seconds)
+    command += [
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(segment_seconds),
+        "-segment_start_number",
+        str(start_number),
+        "-reset_timestamps",
+        "1",
+        "-segment_format",
+        "mp4",
+        "-segment_format_options",
+        "movflags=+frag_keyframe+empty_moov",
+        str(pattern),
+    ]
+    return command
 
 
 @dataclass
@@ -100,9 +201,15 @@ class RecorderManager(QObject):
         while not self._stop.is_set():
             now_wall = time.time()
             now_monotonic = time.monotonic()
-            if system_sleep_gap(
-                self._last_wall_at, self._last_monotonic_at, now_wall, now_monotonic,
-            ) > 8:
+            if (
+                system_sleep_gap(
+                    self._last_wall_at,
+                    self._last_monotonic_at,
+                    now_wall,
+                    now_monotonic,
+                )
+                > 8
+            ):
                 self._recover_after_wake()
             self._last_wall_at = now_wall
             self._last_monotonic_at = now_monotonic
@@ -181,36 +288,21 @@ class RecorderManager(QObject):
         self._fallback_next.discard(room.id)
         stream_url = info.fallback_urls[0] if use_fallback else info.stream_url
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        command = [
-            ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-            "-rw_timeout", "20000000",
-        ]
-        if stream_url.startswith(("http://", "https://")):
-            command += [
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_at_eof", "1",
-                "-reconnect_on_network_error", "1",
-                "-reconnect_on_http_error", "4xx,5xx",
-                "-reconnect_delay_max", "10",
-                "-reconnect_delay_total_max", "60",
-            ]
-        if info.headers:
-            command += ["-headers", info.headers]
-        command += [
-            "-i", stream_url,
-            "-map", "0:v?", "-map", "0:a?",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-f", "segment", "-segment_time", str(segment_seconds),
-            "-segment_start_number", str(start_number),
-            "-reset_timestamps", "1", "-segment_format", "mp4",
-            "-segment_format_options", "movflags=+frag_keyframe+empty_moov",
-            str(pattern),
-        ]
+        command = build_ffmpeg_command(
+            ffmpeg,
+            room.platform,
+            stream_url,
+            info.headers,
+            pattern,
+            start_number,
+            segment_seconds,
+        )
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         kwargs: dict = {
-            "stdin": subprocess.PIPE, "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.PIPE, "creationflags": flags,
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "creationflags": flags,
         }
         if os.name != "nt":
             kwargs["start_new_session"] = True
@@ -221,16 +313,23 @@ class RecorderManager(QObject):
             return
         history_id = self.storage.start_history(room, anchor, info.title, pattern)
         active = ActiveRecording(
-            process, history_id, pattern, time.time(), initial_files,
-            used_fallback=use_fallback, has_fallback=bool(info.fallback_urls),
+            process,
+            history_id,
+            pattern,
+            time.time(),
+            initial_files,
+            used_fallback=use_fallback,
+            has_fallback=bool(info.fallback_urls),
         )
         with self._active_lock:
             self._active[room.id] = active
         self.room_status.emit(room.id, RoomStatus.LIVE.value, f"正在连接视频流：{title}")
         self._emit_counts()
         threading.Thread(
-            target=self._watch_output, args=(room, active, title),
-            name=f"output-{room.id}", daemon=True,
+            target=self._watch_output,
+            args=(room, active, title),
+            name=f"output-{room.id}",
+            daemon=True,
         ).start()
         threading.Thread(
             target=self._watch_process, args=(room, active), name=f"ffmpeg-{room.id}", daemon=True
@@ -286,7 +385,8 @@ class RecorderManager(QObject):
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"未生成文件，正在重新连接：{display}")
         elif result == "saved":
             self.room_status.emit(
-                room.id, RoomStatus.CHECKING.value,
+                room.id,
+                RoomStatus.CHECKING.value,
                 f"已保存 {len(files)} 段视频，正在确认直播状态…",
             )
         elif result == "failed":

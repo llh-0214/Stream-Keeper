@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 
 def run(command: list[str]) -> None:
