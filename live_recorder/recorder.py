@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -38,13 +40,8 @@ def system_sleep_gap(
 
 
 def should_reconnect_in_ffmpeg(platform: Platform, stream_url: str) -> bool:
-    """Avoid byte-range reconnects that can splice a broken live FLV stream."""
-    clean_url = stream_url.lower().split("?", 1)[0]
-    return (
-        stream_url.startswith(("http://", "https://"))
-        and platform is not Platform.DOUYIN
-        and not clean_url.endswith(".flv")
-    )
+    """Retry transient HTTP interruptions; strict decoding still rejects bad video."""
+    return stream_url.startswith(("http://", "https://"))
 
 
 def video_output_args(platform: Platform, segment_seconds: int) -> list[str]:
@@ -87,11 +84,13 @@ def build_ffmpeg_command(
         "-rw_timeout",
         "20000000",
         "-fflags",
-        "+discardcorrupt",
+        "+genpts+discardcorrupt",
         "-err_detect",
         "explode",
         "-xerror",
     ]
+    if platform is Platform.DOUYIN:
+        command += ["-use_wallclock_as_timestamps", "1"]
     if should_reconnect_in_ffmpeg(platform, stream_url):
         command += [
             "-reconnect",
@@ -103,7 +102,7 @@ def build_ffmpeg_command(
             "-reconnect_on_network_error",
             "1",
             "-reconnect_on_http_error",
-            "4xx,5xx",
+            "5xx" if platform is Platform.DOUYIN else "4xx,5xx",
             "-reconnect_delay_max",
             "10",
             "-reconnect_delay_total_max",
@@ -113,6 +112,8 @@ def build_ffmpeg_command(
         command += ["-headers", headers]
     command += ["-i", stream_url, "-map", "0:v?", "-map", "0:a?"]
     command += video_output_args(platform, segment_seconds)
+    if platform is Platform.DOUYIN:
+        command += ["-af", "aresample=async=1000:first_pts=0"]
     command += [
         "-c:a",
         "aac",
@@ -126,6 +127,8 @@ def build_ffmpeg_command(
         str(start_number),
         "-reset_timestamps",
         "1",
+        "-avoid_negative_ts",
+        "make_zero",
         "-segment_format",
         "mp4",
         "-segment_format_options",
@@ -133,6 +136,88 @@ def build_ffmpeg_command(
         str(pattern),
     ]
     return command
+
+
+def _concat_file_line(path: Path) -> str:
+    escaped = str(path.resolve()).replace("'", "'\\''")
+    return f"file '{escaped}'\n"
+
+
+def consolidate_recording_files(
+    files: list[Path],
+    segment_seconds: int,
+    ffmpeg: str,
+) -> list[Path]:
+    """Safely join reconnect fragments and re-split them into target-length MP4 files."""
+    source_files = [path for path in files if path.is_file()]
+    if len(source_files) < 2:
+        return source_files
+    first = source_files[0]
+    match = re.match(r"^(.*_)(\d+)\.mp4$", first.name)
+    if not match:
+        return source_files
+    prefix, number_text = match.groups()
+    start_number = int(number_text)
+    width = len(number_text)
+    temp_dir = Path(tempfile.mkdtemp(prefix=".streamkeeper-merge-", dir=first.parent))
+    try:
+        concat_file = temp_dir / "fragments.txt"
+        concat_file.write_text("".join(_concat_file_line(path) for path in source_files), encoding="utf-8")
+        output_pattern = temp_dir / f"{prefix}%0{width}d.mp4"
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-map",
+            "0:v?",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(segment_seconds),
+            "-segment_time_delta",
+            "0.1",
+            "-segment_start_number",
+            str(start_number),
+            "-reset_timestamps",
+            "1",
+            "-segment_format",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+faststart",
+            str(output_pattern),
+        ]
+        try:
+            completed = subprocess.run(command, capture_output=True, check=False)
+        except OSError:
+            return source_files
+        outputs = sorted(path for path in temp_dir.iterdir() if path.suffix.lower() == ".mp4")
+        if completed.returncode != 0 or not outputs or any(path.stat().st_size == 0 for path in outputs):
+            return source_files
+        final_paths = [first.parent / path.name for path in outputs]
+        source_set = set(source_files)
+        if any(path.exists() and path not in source_set for path in final_paths):
+            return source_files
+        for temp_path, final_path in zip(outputs, final_paths, strict=True):
+            os.replace(temp_path, final_path)
+        final_set = set(final_paths)
+        for source in source_files:
+            if source not in final_set:
+                source.unlink(missing_ok=True)
+        return final_paths
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @dataclass
@@ -169,6 +254,10 @@ class RecorderManager(QObject):
         self._sequence_lock = threading.Lock()
         self._next_check: dict[int, float] = {}
         self._fallback_next: set[int] = set()
+        self._session_lock = threading.Lock()
+        self._session_files: dict[int, list[Path]] = {}
+        self._session_history_ids: dict[int, list[int]] = {}
+        self._session_segment_seconds: dict[int, int] = {}
         self._sleep_preventer = SleepPreventer()
         self._last_wall_at = time.time()
         self._last_monotonic_at = time.monotonic()
@@ -260,12 +349,14 @@ class RecorderManager(QObject):
         try:
             info = asyncio.run(resolve(room.platform, room.url, room.quality, cookie))
             if not info.is_live:
+                self._finalize_session(room.id)
                 name = info.anchor_name if not room.display_name else room.display_name
                 self.room_status.emit(room.id, RoomStatus.OFFLINE.value, f"{name} 暂未开播")
                 return
             self.room_status.emit(room.id, RoomStatus.LIVE.value, "检测到开播，正在启动录制…")
             self._start_recording(room, info, options)
         except ProtectedStreamError as exc:
+            self._finalize_session(room.id)
             self.room_status.emit(room.id, RoomStatus.PROTECTED.value, str(exc))
         except ResolveError as exc:
             self.room_status.emit(room.id, RoomStatus.ERROR.value, str(exc))
@@ -312,6 +403,9 @@ class RecorderManager(QObject):
             self.room_status.emit(room.id, RoomStatus.ERROR.value, f"无法启动 FFmpeg：{exc}")
             return
         history_id = self.storage.start_history(room, anchor, info.title, pattern)
+        with self._session_lock:
+            self._session_history_ids.setdefault(room.id, []).append(history_id)
+            self._session_segment_seconds[room.id] = segment_seconds
         active = ActiveRecording(
             process,
             history_id,
@@ -371,6 +465,10 @@ class RecorderManager(QObject):
         return_code = active.process.returncode
         message = (stderr or b"").decode("utf-8", errors="replace")[-1200:].strip()
         files = new_recording_files(active.output_pattern, active.initial_files)
+        if files:
+            with self._session_lock:
+                known = self._session_files.setdefault(room.id, [])
+                known.extend(path for path in files if path not in known)
         result = recording_result(active, return_code, files)
         if active.no_data_timeout:
             message = "\n".join(part for part in (active.timeout_message, message) if part)
@@ -402,6 +500,26 @@ class RecorderManager(QObject):
         self._next_check[room.id] = time.monotonic() + (1 if retry_quickly else 3)
         self._wake.set()
         self._emit_counts()
+
+    def _finalize_session(self, room_id: int) -> None:
+        with self._session_lock:
+            files = self._session_files.pop(room_id, [])
+            history_ids = self._session_history_ids.pop(room_id, [])
+            segment_seconds = self._session_segment_seconds.pop(room_id, 1800)
+        if not files:
+            return
+        groups: dict[tuple[Path, str], list[Path]] = {}
+        for path in files:
+            match = re.match(r"^(.*_)\d+\.mp4$", path.name)
+            key = (path.parent, match.group(1) if match else path.stem)
+            groups.setdefault(key, []).append(path)
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        merged = []
+        for group_files in groups.values():
+            merged.extend(consolidate_recording_files(group_files, segment_seconds, ffmpeg))
+        if history_ids:
+            self.storage.replace_history_files(history_ids, merged)
+        self.history_changed.emit()
 
     def stop_recording(self, room_id: int) -> None:
         with self._active_lock:
@@ -449,6 +567,16 @@ class RecorderManager(QObject):
             self.stop_recording(room_id)
         if self._thread:
             self._thread.join(timeout=3)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with self._active_lock:
+                if not self._active:
+                    break
+            time.sleep(0.1)
+        with self._session_lock:
+            room_ids = list(self._session_files)
+        for room_id in room_ids:
+            self._finalize_session(room_id)
         self._sleep_preventer.stop()
 
     def active_started_at(self, room_id: int) -> float | None:

@@ -36,6 +36,19 @@ def test_history_round_trip(tmp_path: Path):
     assert json.loads(item["files_json"]) == [str(video)]
 
 
+def test_replace_history_files_updates_reconnect_rows(tmp_path: Path):
+    storage = Storage(tmp_path)
+    room = storage.add_room(Platform.DOUYIN, "https://live.douyin.com/merge")
+    first_id = storage.start_history(room, "主播", "标题", tmp_path / "video_%03d.mp4")
+    second_id = storage.start_history(room, "主播", "标题", tmp_path / "video_%03d.mp4")
+    merged = tmp_path / "video_001.mp4"
+    merged.touch()
+    storage.replace_history_files([first_id, second_id], [merged])
+    rows = storage.list_history()
+    assert all(row["result"] == "completed" for row in rows)
+    assert all(json.loads(row["files_json"]) == [str(merged)] for row in rows)
+
+
 def test_legacy_history_backfill_distinguishes_same_day_sessions(tmp_path: Path):
     storage = Storage(tmp_path / "data")
     room = storage.add_room(Platform.DOUYIN, "https://live.douyin.com/legacy")
@@ -48,9 +61,13 @@ def test_legacy_history_backfill_distinguishes_same_day_sessions(tmp_path: Path)
             "INSERT INTO history(room_id,platform,anchor_name,file_path,started_at,ended_at,result) "
             "VALUES(?,?,?,?,?,?,?)",
             (
-                room.id, room.platform.value, "主播", str(pattern),
+                room.id,
+                room.platform.value,
+                "主播",
+                str(pattern),
                 datetime.fromtimestamp(stamp + 60).isoformat(timespec="seconds"),
-                datetime.fromtimestamp(stamp + 120).isoformat(timespec="seconds"), "failed",
+                datetime.fromtimestamp(stamp + 120).isoformat(timespec="seconds"),
+                "failed",
             ),
         )
         Storage._backfill_history_files(db)

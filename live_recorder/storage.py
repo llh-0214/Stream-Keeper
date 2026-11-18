@@ -81,8 +81,7 @@ class Storage:
             # v0.2.1 labelled a recording as failed whenever FFmpeg ended with a
             # network error, even if valid segments had already been saved.
             db.execute(
-                "UPDATE history SET result='saved' "
-                "WHERE result='failed' AND COALESCE(files_created, 0) > 0"
+                "UPDATE history SET result='saved' WHERE result='failed' AND COALESCE(files_created, 0) > 0"
             )
 
     @staticmethod
@@ -99,7 +98,8 @@ class Storage:
                 started = datetime.fromisoformat(row["started_at"]).timestamp() - 5
                 ended = datetime.fromisoformat(row["ended_at"]).timestamp() + 30
                 files = [
-                    path for path in pattern.parent.glob(glob_name)
+                    path
+                    for path in pattern.parent.glob(glob_name)
                     if started <= path.stat().st_mtime <= ended
                 ]
             except (OSError, ValueError):
@@ -115,8 +115,11 @@ class Storage:
             rows = db.execute("SELECT * FROM rooms ORDER BY id").fetchall()
         return [
             Room(
-                id=row["id"], platform=Platform(row["platform"]), url=row["url"],
-                display_name=row["display_name"], enabled=bool(row["enabled"]),
+                id=row["id"],
+                platform=Platform(row["platform"]),
+                url=row["url"],
+                display_name=row["display_name"],
+                enabled=bool(row["enabled"]),
                 quality=row["quality"],
                 status=RoomStatus.OFFLINE if row["enabled"] else RoomStatus.PAUSED,
             )
@@ -182,23 +185,51 @@ class Storage:
                 "INSERT INTO history(room_id,platform,anchor_name,title,file_path,started_at,files_created,files_json) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (
-                    room.id, room.platform.value, anchor, title, str(path),
-                    datetime.now().isoformat(timespec="seconds"), 0, "[]",
+                    room.id,
+                    room.platform.value,
+                    anchor,
+                    title,
+                    str(path),
+                    datetime.now().isoformat(timespec="seconds"),
+                    0,
+                    "[]",
                 ),
             )
             return int(cursor.lastrowid)
 
     def finish_history(
-        self, history_id: int, result: str, error: str = "", files: list[Path] | None = None,
+        self,
+        history_id: int,
+        result: str,
+        error: str = "",
+        files: list[Path] | None = None,
     ) -> None:
         file_strings = [str(path) for path in (files or [])]
         with self._connect() as db:
             db.execute(
                 "UPDATE history SET ended_at=?,result=?,error=?,files_created=?,files_json=? WHERE id=?",
                 (
-                    datetime.now().isoformat(timespec="seconds"), result, error,
-                    len(file_strings), json.dumps(file_strings, ensure_ascii=False), history_id,
+                    datetime.now().isoformat(timespec="seconds"),
+                    result,
+                    error,
+                    len(file_strings),
+                    json.dumps(file_strings, ensure_ascii=False),
+                    history_id,
                 ),
+            )
+
+    def replace_history_files(self, history_ids: list[int], files: list[Path]) -> None:
+        """Point reconnect history rows at the consolidated final files."""
+        if not history_ids:
+            return
+        file_strings = [str(path) for path in files]
+        payload = json.dumps(file_strings, ensure_ascii=False)
+        placeholders = ",".join("?" for _ in history_ids)
+        with self._connect() as db:
+            db.execute(
+                f"UPDATE history SET result='completed',error='',files_created=?,files_json=? "
+                f"WHERE id IN ({placeholders})",
+                (len(file_strings), payload, *history_ids),
             )
 
     def list_history(self, limit: int = 300) -> list[dict[str, Any]]:
